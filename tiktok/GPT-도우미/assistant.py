@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import threading
+import unicodedata
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.request import Request, urlopen
@@ -43,16 +44,123 @@ INSTRUCTIONS = RULES + (
 )
 
 def condition_list(value):
-    parts=[part.strip() for part in re.split(r"[,，;；\n]+",value) if part.strip()]
+    # One condition per line. Commas and semicolons stay inside that line.
+    text=str(value or "").replace("\u00a0"," ").replace("\r\n","\n").replace("\r","\n")
+    parts=[line.strip() for line in text.split("\n") if line.strip()]
     if len(parts)>8: parts=parts[:7]+["; ".join(parts[7:])]
-    return [{"id":"r"+str(index+1),"text":text} for index,text in enumerate(parts)]
+    return [{"id":"r"+str(index+1),"text":part} for index,part in enumerate(parts)]
 
 def needs_external_confirmation(text):
     # Public post history cannot verify this campaign's logistics, audiences or results.
+    # A numeric follower-count threshold is judged separately against the sent follower count.
     return bool(re.search(
         r"가능|일정|현장|방문\s*촬영|팔로워|시청자|거주|인사이트|연령|성별|비중|매출|주문|전환|실적|단가|예산|독점|저작권|동의|계약|협업\s*(?:확인|없)|이력\s*없|없어야|없을\s*것"
         r"|\b(?:availability|available|onsite|on-site|filming|shoot|audience|followers|demographics|residen\w*|sales|conversion|orders|budget|exclusiv\w*|licens\w*|permission|contract|no prior)\b",
         text,re.I))
+
+_FOLLOWER_WORD=re.compile(r"팔로(?:워|우)(?:\s*수)?|(?<![A-Za-z])followers?(?![A-Za-z])|(?<![A-Za-z])follower\s+counts?(?![A-Za-z])",re.I)
+_FOLLOWER_NUMBER=re.compile(r"(?P<num>\d+(?:[,，]\d{3})*(?:\.\d+)?)\s*(?P<unit>천만|백만|억|만|천|[kKmM](?![A-Za-z]))?(?P<people>명)?")
+_FOLLOWER_UNITS={"천":1000,"만":10000,"억":100000000,"천만":10000000,"백만":1000000,"k":1000,"K":1000,"m":1000000,"M":1000000}
+_FOLLOWER_OPS=(
+    ("gt",re.compile(r"초과|넘는|넘은|보다\s*많|보다\s*크|보다\s*높|more\s*than|greater\s*than|(?<![A-Za-z])over(?![A-Za-z])|(?<![A-Za-z])above(?![A-Za-z])",re.I)),
+    ("lt",re.compile(r"미만|보다\s*적|보다\s*작|보다\s*낮|less\s*than|(?<![A-Za-z])under(?![A-Za-z])|(?<![A-Za-z])below(?![A-Za-z])",re.I)),
+    ("gte",re.compile(r"이상(?!한)|최소|적어도|at\s*least|or\s*more|(?<![A-Za-z])minimum(?![A-Za-z])|\+|＋|↑",re.I)),
+    ("lte",re.compile(r"이하|최대|at\s*most|up\s*to|(?<![A-Za-z])maximum(?![A-Za-z])",re.I)),
+)
+
+def _follower_number_value(match):
+    try: number=float(match.group("num").replace(",","").replace("，",""))
+    except ValueError: return None
+    value=number*_FOLLOWER_UNITS.get(match.group("unit"),1)
+    if value<0 or value>10**12 or abs(value-round(value))>1e-4: return None
+    return int(round(value))
+
+def _follower_number_blocked(text,match):
+    tail=text[match.end():]
+    if re.match(r"\s*(?:대|세|살|%|％|퍼센트|percent\b)",tail,re.I): return True
+    return bool(re.match(r"[A-Za-z]",tail))
+
+def _near_follower_word(text,match,words):
+    for word in words:
+        if match.end()<=word.start(): gap=text[match.end():word.start()]
+        elif word.end()<=match.start(): gap=text[word.end():match.start()]
+        else: return True
+        if len(gap)<=16 and not re.search(r"[,，;；\n]|연령|성별|거주|예산|매출|반응",gap): return True
+    return False
+
+def _assign_follower_ops(text,numbers):
+    found=[]
+    for op,pattern in _FOLLOWER_OPS:
+        for match in pattern.finditer(text): found.append((op,match.start(),match.end()))
+    chosen={}
+    for op,start,end in found:
+        best=None
+        for index,number in enumerate(numbers):
+            if end<=number.start(): dist,after=number.start()-end,False
+            elif start>=number.end(): dist,after=start-number.end(),True
+            else: dist,after=0,True
+            if dist>10: continue
+            if best is None or dist<best[0] or (dist==best[0] and after and not best[2]):
+                best=(dist,index,after)
+        if best is None: continue
+        previous=chosen.get(best[1])
+        if previous is None or best[0]<previous[1] or (best[0]==previous[1] and best[2] and not previous[2]):
+            chosen[best[1]]=(op,best[0],best[2])
+    return chosen
+
+def parse_follower_thresholds(text):
+    raw=unicodedata.normalize("NFKC",str(text or ""))
+    words=list(_FOLLOWER_WORD.finditer(raw))
+    if not words: return []
+    numbers=[match for match in _FOLLOWER_NUMBER.finditer(raw) if _near_follower_word(raw,match,words) and not _follower_number_blocked(raw,match) and _follower_number_value(match) is not None]
+    ops=_assign_follower_ops(raw,numbers)
+    checks=[]
+    for index,match in enumerate(numbers):
+        if index not in ops: continue
+        checks.append((ops[index][0],_follower_number_value(match)))
+    return checks
+
+def _follower_meets(count,op,value):
+    return {"gte":count>=value,"gt":count>value,"lte":count<=value,"lt":count<value}[op]
+
+def follower_threshold_only(text):
+    raw=unicodedata.normalize("NFKC",str(text or ""))
+    raw=re.sub(r"팔로(?:워|우)(?:\s*수)?|(?<![A-Za-z])followers?(?![A-Za-z])|(?<![A-Za-z])follower\s+counts?(?![A-Za-z])"," ",raw,flags=re.I)
+    raw=re.sub(r"\d+(?:[,，]\d{3})*(?:\.\d+)?\s*(?:천만|백만|억|만|천|[kKmM])?\s*명?"," ",raw)
+    raw=re.sub(r"이상(?!한)|이하|미만|초과|최소|최대|적어도|넘는|넘은|보다\s*[많적크작높]|at\s*least|at\s*most|or\s*more|more\s*than|greater\s*than|less\s*than|up\s*to|(?<![A-Za-z])(?:over|under|above|below|minimum|maximum)(?![A-Za-z])|\+|＋|↑"," ",raw,flags=re.I)
+    for word in ("필수조건","필수","조건","계정","기준","그리고","및","이어야","해야","합니다","입니다","해요","필요"):
+        raw=re.sub(rf"(?<![가-힣A-Za-z]){word}(?![가-힣A-Za-z])"," ",raw)
+    for word in ("수","명","and"):
+        raw=re.sub(rf"(?<![가-힣A-Za-z]){word}(?![가-힣A-Za-z])"," ",raw,flags=re.I)
+    return re.sub(r"[\W_]+","",raw,flags=re.U)==""
+
+def without_follower_count(text):
+    raw=unicodedata.normalize("NFKC",str(text or ""))
+    raw=re.sub(r"(?:최소|적어도|최대|at\s*least|at\s*most|minimum|maximum|more\s*than|less\s*than|over|under|above|below)?\s*(?:팔로(?:워|우)(?:\s*수)?|followers?|follower\s+counts?)\s*(?:최소|적어도|최대)?\s*\d+(?:[,，]\d{3})*(?:\.\d+)?\s*(?:천만|백만|억|만|천|[kKmM])?\s*명?\s*(?:이상|이하|미만|초과|최소|최대|\+|＋|↑|넘는|넘은)?"," ",raw,flags=re.I)
+    raw=re.sub(r"(?:최소|적어도|최대|at\s*least|at\s*most)?\s*\d+(?:[,，]\d{3})*(?:\.\d+)?\s*(?:천만|백만|억|만|천|[kKmM])?\s*명?\s*(?:\+|＋|↑|이상|이하|미만|초과)?\s*(?:팔로(?:워|우)(?:\s*수)?|followers?)"," ",raw,flags=re.I)
+    return raw
+
+def follower_judgment(text,followers):
+    checks=parse_follower_thresholds(text)
+    if not checks: return None
+    pure=follower_threshold_only(text)
+    if type(followers) is not int:
+        return {"state":"미확인","reason":"팔로워 수를 아직 확인하지 못해 이 기준은 미확인이에요.","pure":pure}
+    failed=[(op,value) for op,value in checks if not _follower_meets(followers,op,value)]
+    if failed:
+        if all(op in ("lte","lt") for op,_ in failed):
+            reason=f"프로필에서 확인한 팔로워 {followers:,}명이 이 상한 기준을 넘어요."
+        elif all(op in ("gte","gt") for op,_ in failed):
+            reason=f"프로필에서 확인한 팔로워 {followers:,}명이 이 기준에 못 미쳐요."
+        else:
+            reason=f"프로필에서 확인한 팔로워 {followers:,}명이 이 기준에 맞지 않아요."
+        return {"state":"충돌","reason":reason,"pure":pure}
+    if pure:
+        return {"state":"확인","reason":f"프로필에서 확인한 팔로워 {followers:,}명이 이 기준을 충족해요.","pure":True}
+    return {"state":"부분충족","reason":"","pure":False}
+
+_EXTERNAL_REASON="공개 게시물의 과거 활동만으로 이번 캠페인의 실행 가능 여부·실적·고객층을 확인할 수 없어 별도 증빙이 필요해요."
+_QUOTE_REASON="인용한 원문을 게시물에서 확인하지 못해 이 조건은 미확인으로 뒀어요."
 
 def validate_conditions(obj,data):
     expected={item["id"]:item["text"] for item in data.get("conditions",[])}
@@ -70,10 +178,28 @@ def validate_conditions(obj,data):
         if not isinstance(evidence,list) or len(evidence)>2: raise ValueError("필수조건 근거를 확인해주세요.")
         verified=validate(dict(verdict="판단 보류" if state=="미확인" else "보통",summary=reason,limits="조건 검토",check="조건 검토",evidence=evidence),dict(data,fitTargets=[],conditions=[],requirements="",brief="조건 검토"))
         text=expected[check["id"]]
-        if state=="확인" and needs_external_confirmation(text):
-            state="미확인"
-            reason="공개 게시물의 과거 활동만으로 이번 캠페인의 실행 가능 여부·실적·고객층을 확인할 수 없어 별도 증빙이 필요해요."
-        accepted.append(dict(id=check["id"],text=text,state=state,reason=reason[:300],evidence=verified["evidence"]))
+        kept=verified["evidence"]
+        judged=follower_judgment(text,data.get("followers"))
+        if judged and judged["state"]=="충돌":
+            state,reason,kept="충돌",judged["reason"],[]
+        elif judged and judged["state"]=="확인":
+            state,reason="확인",judged["reason"]
+        elif judged and judged["state"]=="미확인" and judged["pure"]:
+            state,reason="미확인",judged["reason"]
+        elif judged and judged["state"]=="미확인":
+            if state=="확인" or not kept:
+                state,reason="미확인",judged["reason"]
+        elif judged and judged["state"]=="부분충족":
+            if state=="확인" and needs_external_confirmation(without_follower_count(text)):
+                state,reason="미확인",_EXTERNAL_REASON
+            elif state in ("확인","충돌") and not kept:
+                state,reason="미확인",_QUOTE_REASON
+        else:
+            if state in ("확인","충돌") and not kept:
+                state,reason="미확인",_QUOTE_REASON
+            elif state=="확인" and needs_external_confirmation(text):
+                state,reason="미확인",_EXTERNAL_REASON
+        accepted.append(dict(id=check["id"],text=text,state=state,reason=reason[:300],evidence=kept))
         seen.add(check["id"])
     return accepted
 
@@ -81,7 +207,9 @@ def apply_condition_gate(result,checks):
     conflicts=[check for check in checks if check["state"]=="충돌"]
     missing=[check for check in checks if check["state"]=="미확인"]
     if conflicts:
-        message="필수조건과 충돌하는 게시물 표현이 있어요: "+"; ".join(check["text"] for check in conflicts)
+        quoted=any(check["evidence"] for check in conflicts)
+        lead="필수조건과 충돌하는 게시물 표현이 있어요: " if quoted else "확인된 팔로워 수가 필수조건 기준에 맞지 않아요: "
+        message=lead+"; ".join(check["text"] for check in conflicts)
         evidence=[];seen=set()
         for check in conflicts:
             for item in check["evidence"]:
@@ -147,6 +275,32 @@ def clean(src):
         rows.append(row)
     if not any(row["text"].strip() for row in rows): raise ValueError("판단할 원문 텍스트가 없습니다.")
     return dict(payload,posts=rows)
+def locate_quote(quote, segments):
+    # Exact text still wins. Spacing and punctuation-only differences map back onto the post.
+    quote=unicodedata.normalize("NFKC",str(quote)).replace("\u00a0"," ").replace("\u200b","").replace("\ufeff","")
+    folded=" ".join(quote.split())
+    if not folded: return None
+    prepared=[]
+    for part in segments:
+        norm=unicodedata.normalize("NFKC",str(part)).replace("\u00a0"," ").replace("\u200b","").replace("\ufeff","")
+        prepared.append((norm," ".join(norm.split())))
+    for _,folded_part in prepared:
+        if folded in folded_part: return folded
+    def skeleton(text):
+        return [(index,ch) for index,ch in enumerate(text) if not ch.isspace() and not unicodedata.category(ch).startswith("P")]
+    query=skeleton(quote)
+    if not query: return None
+    needle="".join(ch for _,ch in query)
+    for norm,_ in prepared:
+        hay=skeleton(norm)
+        if not hay: continue
+        at="".join(ch for _,ch in hay).find(needle)
+        if at<0: continue
+        start=hay[at][0]
+        end=hay[at+len(needle)-1][0]+1
+        found=" ".join(norm[start:end].split())
+        if found: return found
+    return None
 def validate(obj,data):
     if not isinstance(obj,dict) or obj.get("verdict") not in VERDICTS or not all(
             isinstance(obj.get(key),str) and obj[key].strip() for key in ("summary","limits","check")):
@@ -165,17 +319,19 @@ def validate(obj,data):
         if not isinstance(item,dict) or not all(isinstance(item.get(k),str) for k in ("id","quote","why")):
             raise ValueError("근거 형식을 확인할 수 없습니다.")
         key=item["id"]
-        quote=" ".join(item["quote"].split())
-        if key not in by_id or key in seen or not quote or not any(quote in part for part in by_id[key]) or not item["why"].strip():
-            raise ValueError("원문 인용을 확인할 수 없습니다.")
+        if key not in by_id or key in seen or not item["why"].strip(): continue
+        quote=locate_quote(item["quote"],by_id[key])
+        if not quote: continue
         accepted.append(dict(id=key,quote=quote,why=item["why"][:400]))
         seen.add(key)
     verdict=obj["verdict"]
+    summary=obj["summary"]
     if verdict != "판단 보류" and not accepted:
-        raise ValueError("섭외 등급의 근거가 되는 원문이 없습니다.")
+        verdict="판단 보류"
+        summary="원문에서 확인되는 인용이 없어 판단을 보류해요. "+summary
     if verdict == "추천" and not data.get("brief","").strip() and not data.get("fitTargets"):
         raise ValueError("추천 여부를 검토할 제품·매장이 지정되지 않았습니다.")
-    result=dict(verdict=verdict,summary=obj["summary"][:600],evidence=accepted,limits=obj["limits"][:600],check=obj["check"][:500])
+    result=dict(verdict=verdict,summary=summary[:600],evidence=accepted,limits=obj["limits"][:600],check=obj["check"][:500])
     checks=validate_conditions(obj,data)
     expected={t["kind"] for t in data.get("fitTargets",[])}
     fits=obj.get("fits",[])
@@ -187,7 +343,7 @@ def validate(obj,data):
         if not isinstance(fit.get("reason"),str) or not fit["reason"].strip() or not isinstance(fit.get("missing"),str):
             raise ValueError("적합도 설명을 확인할 수 없습니다.")
         if not isinstance(fit.get("evidence"),list) or len(fit["evidence"])>2: raise ValueError("적합도 근거 수를 확인해주세요.")
-        # Reuse exact quotation validation; a missing post or invented quote rejects the result.
+        # Reuse quotation checks. An unmatched quote is dropped instead of rejecting the paid review.
         check=validate(dict(verdict=fit.get("verdict"),summary=fit["reason"],limits=fit["missing"] or "없음",check="대상별 검토",evidence=fit["evidence"]),dict(data,fitTargets=[],conditions=[],requirements="",brief="입력된 대상"))
         cleaned=dict(kind=fit["kind"],verdict=check["verdict"],reason=check["summary"],evidence=check["evidence"],missing=fit["missing"][:500])
         if fit["kind"]=="brand" and cleaned["verdict"]=="추천":
@@ -223,7 +379,7 @@ class Handler(BaseHTTPRequestHandler):
         auth=self.headers.get("Authorization","").encode()
         if not hmac.compare_digest(auth,("Bearer "+self.server.token).encode()):
             return self.send_json(401,{"error":"연결 코드를 확인해주세요."})
-        if self.path=="/check": return self.send_json(200,{"ok":True,"protocol":3,"version":"2.0.1"})
+        if self.path=="/check": return self.send_json(200,{"ok":True,"protocol":3,"version":"2.0.2"})
         if self.path not in ("/review","/review-campaign-fit","/review-fit-v2","/review-fit-v201"): return self.send_json(404,{})
         if not self.server.lock.acquire(blocking=False): return self.send_json(409,{"error":"다른 검토를 처리하고 있습니다."})
         try:
