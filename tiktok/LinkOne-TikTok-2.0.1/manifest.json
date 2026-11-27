@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "LinkOne · 틱톡 크리에이터 검토",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "description": "계정·관련 게시물 지표를 비교하고 제품·매장·브랜드 적합도를 원문 근거로 검토합니다.",
   "permissions": [
     "storage"

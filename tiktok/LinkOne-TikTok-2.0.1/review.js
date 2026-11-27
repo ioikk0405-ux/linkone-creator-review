@@ -78,9 +78,10 @@ const CampaignReview = (() => {
   }
 
   function conditionList(config={}){
-    const parts=String(config.requirements||'').split(/[,，;；\n]+/u).map(s=>s.trim()).filter(Boolean);
+    const text=String(config.requirements||'').replace(/\u00a0/g,' ').replace(/\r\n/g,'\n').replace(/\r/g,'\n');
+    const parts=text.split('\n').map(s=>s.trim()).filter(Boolean);
     const grouped=parts.length>8?[...parts.slice(0,7),parts.slice(7).join('; ')]:parts;
-    return grouped.map((text,index)=>({id:'r'+(index+1),text}));
+    return grouped.map((part,index)=>({id:'r'+(index+1),text:part}));
   }
 
   const fitLabels={product:'제품 적합도',store:'매장 홍보 적합도',brand:'브랜드 적합도'};
