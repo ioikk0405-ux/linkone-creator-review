@@ -1,0 +1,51 @@
+{
+  "manifest_version": 3,
+  "name": "LinkOne · 인스타 크리에이터 검토",
+  "version": "2.0.1",
+  "description": "계정·관련 게시물 지표를 비교하고 제품·매장·브랜드 적합도를 원문 근거로 검토합니다.",
+  "permissions": [
+    "storage"
+  ],
+  "optional_host_permissions": [
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "worker.js"
+  },
+  "options_page": "settings.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.instagram.com/*",
+        "https://instagram.com/*"
+      ],
+      "js": [
+        "analysis.js",
+        "review-rules.js",
+        "review.js",
+        "reader.js",
+        "picks.js",
+        "theme.js",
+        "panel.js",
+        "instagram.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "icon48.png"
+      ],
+      "matches": [
+        "https://www.instagram.com/*",
+        "https://instagram.com/*"
+      ]
+    }
+  ]
+}
